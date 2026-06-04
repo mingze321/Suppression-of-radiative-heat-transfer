@@ -21,7 +21,7 @@ The two material files must exist because the code reads them directly.
 Use Python with TensorFlow installed. The script needs:
 
 ```bash
-pip install tensorflow tensorflow-probability numpy scipy matplotlib
+pip install tensorflow numpy scipy matplotlib
 ```
 
 The code currently forces TensorFlow to use the CPU, so a GPU is not required.
