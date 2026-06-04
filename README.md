@@ -93,3 +93,8 @@ The script also produces plots showing:
 - The optimized layer thicknesses are stored in `export_t_1` and `export_t_2` during the run.
 - The script uses the S-polarization transfer-matrix formulas by default. P-polarization formulas are present but commented out.
 - Check the wavelength and wavenumber naming carefully before modifying the spectral range, because the code converts between them using `10000000 / wavelength`.
+
+- ## 7. Citation and contact
+
+- You can cite all versions by using the DOI 10.5281/zenodo.20549145. This DOI represents all versions, and will always resolve to the latest one. Read more.
+- If you have any questions, or need help to use the code, please feel free to contact Dr. Mingze He,  hemingze1995@gmail.com
