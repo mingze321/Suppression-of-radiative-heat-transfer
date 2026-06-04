@@ -1,552 +1,395 @@
 import os
+from pathlib import Path
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-import tensorflow as tf
-import math
-import numpy as np
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 import matplotlib.pyplot as plt
-
-print(tf.__version__)
+import numpy as np
+import tensorflow as tf
 from tensorflow.keras import Model
-import tensorflow_probability as tfp
-from scipy.stats import norm
-from scipy.stats import cauchy
-from scipy.interpolate import interp1d
-
-# import pylab as pl
-
-# Set CPU as available physical device
-my_devices = tf.config.experimental.list_physical_devices(device_type='CPU')
-tf.config.experimental.set_visible_devices(devices=my_devices, device_type='CPU')
-
-# To find out which devices your operations and tensors are assigned to
-tf.debugging.set_log_device_placement(False)
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_DIR = SCRIPT_DIR / "dielectric_functions"
+
+EPOCHS = 1500
+NUM_TRIALS = 10
+BATCH_SIZE = 256
+SHUFFLE_BUFFER = 5000
+INITIAL_LEARNING_RATE = 0.01
+MAX_THICKNESS_NM = 1350.0
+INCIDENT_ANGLE_DEG = 30.0
 
 
+def configure_tensorflow():
+    tf.keras.backend.set_floatx("float64")
+    tf.debugging.set_log_device_placement(False)
 
-# Define a single layer transfer matrix
-def Ch_Matrix(theta_in, n0, n1, d1, n2, k0):
+    gpus = tf.config.list_physical_devices("GPU")
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+
+    print(f"TensorFlow {tf.__version__}")
+    print(f"GPUs visible to TensorFlow: {gpus}")
+
+
+def load_regular_material_grid(filename):
+    data = np.genfromtxt(DATA_DIR / filename, skip_header=False)
+    frequency = data[:, 0]
+    real = data[:, 1]
+    imag = data[:, 2]
+
+    sort_order = np.argsort(frequency)
+    frequency = frequency[sort_order]
+    real = real[sort_order]
+    imag = imag[sort_order]
+
+    full_frequency = np.arange(400, 6000, 1, dtype=np.float64)
+    full_real = np.interp(full_frequency, frequency, real)
+    full_imag = np.interp(full_frequency, frequency, imag)
+
+    return (
+        tf.constant(full_real, dtype=tf.float64),
+        tf.constant(full_imag, dtype=tf.float64),
+    )
+
+
+def interp_regular_1d(x, y_ref, x_ref_min=400.0, x_ref_step=1.0):
+    x = tf.cast(x, tf.float64)
+    y_ref = tf.cast(y_ref, tf.float64)
+    max_index = tf.shape(y_ref)[0] - 2
+
+    position = (x - x_ref_min) / x_ref_step
+    lower_index = tf.cast(tf.floor(position), tf.int32)
+    lower_index = tf.clip_by_value(lower_index, 0, max_index)
+    upper_index = lower_index + 1
+
+    lower_x = x_ref_min + tf.cast(lower_index, tf.float64) * x_ref_step
+    weight = (x - lower_x) / x_ref_step
+    weight = tf.clip_by_value(weight, 0.0, 1.0)
+
+    lower_y = tf.gather(y_ref, lower_index)
+    upper_y = tf.gather(y_ref, upper_index)
+    return lower_y + weight * (upper_y - lower_y)
+
+
+def material_index_from_grid(wavelength, real_grid, imag_grid):
+    k = 10000000.0 / wavelength
+    real = interp_regular_1d(k, real_grid)
+    imag = interp_regular_1d(k, imag_grid)
+    return tf.complex(real, imag)
+
+
+def ch_matrix(theta_in, n0, n1, d1, n2, k0):
     one_m = tf.constant(1.0, tf.float64)
     zeros_m = tf.constant(0.0, tf.float64)
     imag = tf.complex(zeros_m, one_m)
 
-    W, L = n0.shape
+    width, _ = n0.shape
 
-    zeros_temp = tf.constant(0.0, dtype=tf.float64, shape=(W, 1))
+    zeros_temp = tf.constant(0.0, dtype=tf.float64, shape=(width, 1))
     zeros_complex = tf.complex(zeros_temp, zeros_m)
 
-    ones_temp = tf.constant(1.0, dtype=tf.float64, shape=(W, 1))
+    ones_temp = tf.constant(1.0, dtype=tf.float64, shape=(width, 1))
     ones_complex = tf.complex(ones_temp, zeros_m)
-
-    #     theta_in=tf.complex(theta_in,zeros_m)
 
     k0 = tf.complex(k0, zeros_m)
     di = tf.complex(d1, zeros_m)
-    di = tf.reshape(di, (W, 1))
-    n1 = tf.reshape(n1, (W, 1))
-    n2 = tf.reshape(n2, (W, 1))
+    di = tf.reshape(di, (width, 1))
+    n1 = tf.reshape(n1, (width, 1))
+    n2 = tf.reshape(n2, (width, 1))
     cos1 = 1 / n1 * tf.math.sqrt(n1 ** 2 - (n0 * tf.math.sin(theta_in)) ** 2)
     cos2 = 1 / n2 * tf.math.sqrt(n2 ** 2 - (n0 * tf.math.sin(theta_in)) ** 2)
-    # print (cos1, 'cos1')
 
-
-    # IMPORTANT the commented code are for S-POL light
-    rs12= (n1*cos1-n2*cos2)/ (n1*cos1+n2* cos2)
-    ts12= 2*n1*cos1/ (n1*cos1+n2* cos2)
-    # # IMPORTANT the following code are for P-POL light
+    # S-polarized Fresnel coefficients. Use the commented equations below for P-polarization.
+    rs12 = (n1 * cos1 - n2 * cos2) / (n1 * cos1 + n2 * cos2)
+    ts12 = 2 * n1 * cos1 / (n1 * cos1 + n2 * cos2)
     # rs12 = (n2 * cos1 - n1 * cos2) / (n2 * cos1 + n1 * cos2)
     # ts12 = 2 * n1 * cos1 / (n2 * cos1 + n1 * cos2)
 
     ts12 = tf.expand_dims(ts12, axis=2)
 
     optical_pass = di * k0 * n1 * cos1
-    # print (optical_pass.shape, di.shape, k0.shape, n1.shape, cos1.shape, W, 'all shapes')
-    Matrix = [[tf.math.exp(-imag * optical_pass), zeros_complex], [zeros_complex, tf.math.exp(imag * optical_pass)]]
-    Matrix = tf.reshape(Matrix, shape=(4, W))
-    Matrix = tf.reshape(Matrix, shape=(2, 2, W))
-    Matrix = tf.transpose(Matrix, [2, 1, 0])
+    matrix = [
+        [tf.math.exp(-imag * optical_pass), zeros_complex],
+        [zeros_complex, tf.math.exp(imag * optical_pass)],
+    ]
+    matrix = tf.reshape(matrix, shape=(4, width))
+    matrix = tf.reshape(matrix, shape=(2, 2, width))
+    matrix = tf.transpose(matrix, [2, 1, 0])
 
-    M_t2 = [[ones_complex, rs12], [rs12, ones_complex]]
-    M_t2 = tf.reshape(M_t2, shape=(4, W))
-    M_t2 = tf.reshape(M_t2, shape=(2, 2, W))
-    M_t2 = tf.transpose(M_t2, [2, 1, 0])
+    interface_matrix = [[ones_complex, rs12], [rs12, ones_complex]]
+    interface_matrix = tf.reshape(interface_matrix, shape=(4, width))
+    interface_matrix = tf.reshape(interface_matrix, shape=(2, 2, width))
+    interface_matrix = tf.transpose(interface_matrix, [2, 1, 0])
 
-    M2 = tf.linalg.matmul(Matrix, M_t2) / ts12
-
-    return M2
+    return tf.linalg.matmul(matrix, interface_matrix) / ts12
 
 
-# Define the model of the TMM
-# Define the model of the TMM
-def TMM(theta_in, n0, n, d, k0):
-    #     L=tf.size(n)
-    #     print (n)
-    temp = n
-    W, L = temp.shape
-    L = L - 1
+def tmm(theta_in, n0, n, d, k0):
+    width, layer_count = n.shape
+    layer_count = layer_count - 1
 
-    one_m = tf.constant(1.0, tf.float64, shape=[W, 1])
-    zeros_m = tf.constant(0.0, tf.float64, shape=[W, 1])
+    one_m = tf.constant(1.0, tf.float64, shape=[width, 1])
+    zeros_m = tf.constant(0.0, tf.float64, shape=[width, 1])
     one_m_complex = tf.complex(one_m, zeros_m)
 
     cos0 = tf.math.cos(theta_in)
     cos1 = 1 / n[0, 0] * tf.math.sqrt(n[0, 0] ** 2 - (n0 * tf.math.sin(theta_in)) ** 2)
 
+    # S-polarized Fresnel coefficients. Use the commented equations below for P-polarization.
+    ts01 = 2 * n0 * cos0 / (n0 * cos0 + n[0, 0] * cos1)
+    ts01 = tf.expand_dims(ts01, axis=2)
+    rs01 = (n0 * cos0 - n[0, 0] * cos1) / (n0 * cos0 + n[0, 0] * cos1)
+    # ts01 = 2 * n0 * cos0 / (n[0, 0] * cos0 + n0 * cos1)
+    # ts01 = tf.expand_dims(ts01, axis=2)
+    # rs01 = (n[0, 0] * cos0 - n0 * cos1) / (n[0, 0] * cos0 + n0 * cos1)
 
-    # IMPORTANT the commented code are for S-POL light
-    ts01=2*n0*cos0/ (n0*cos0 +n[0,0] *cos1)
-    ts01=tf.expand_dims(ts01, axis=2)
-    rs01= (n0*cos0 -n[0,0] *cos1)/(n0*cos0 +n[0,0] *cos1)
-    # IMPORTANT the following module are for P-POL light
-    # ts01=2*n0*cos0/ (n[0,0]*cos0 +n0 *cos1)
-    # ts01=tf.expand_dims(ts01, axis=2)
-    # rs01= (n[0,0]*cos0 -n0 *cos1) / (n[0,0]*cos0 +n0 *cos1)
+    interface_01 = [[one_m_complex, rs01], [rs01, one_m_complex]]
+    interface_01 = tf.reshape(interface_01, shape=(4, width))
+    interface_01 = tf.reshape(interface_01, shape=(2, 2, width))
+    interface_01 = tf.transpose(interface_01, [2, 1, 0])
 
-    M01 = [[one_m_complex, rs01], [rs01, one_m_complex]]
-    M01 = tf.reshape(M01, shape=(4, W))
-    M01 = tf.reshape(M01, shape=(2, 2, W))
-    M01 = tf.transpose(M01, [2, 1, 0])
+    transfer = interface_01 / ts01
 
-    M0 = M01 / ts01
-    Transfer = M0
+    for layer_ind in range(layer_count):
+        layer_transfer = ch_matrix(
+            theta_in,
+            n0,
+            n[:, layer_ind],
+            d[:, layer_ind],
+            n[:, layer_ind + 1],
+            k0,
+        )
+        transfer = tf.linalg.matmul(transfer, layer_transfer)
 
-    for layer_ind in range(L):
-        Temp_transfer_matrix = Ch_Matrix(theta_in, n0, n[:, layer_ind], d[:, layer_ind], n[:, layer_ind + 1], k0)
-        # print ('transfer matrix',Temp_transfer_matrix)
-        # print ('medium transfer', layer_ind, Temp_transfer_matrix)
-        Transfer = tf.linalg.matmul(Transfer, Temp_transfer_matrix)
-
-    #         Transfer=Transfer * Temp_transfer_matrix
-    return Transfer
+    return transfer
 
 
-# Reflectance calculation for Porous Si
-# Reflectance calculation for Porous Si
-# Reflectance calculation for Porous Si
-def reflectance(wavelength, theta_in, n0, n, d1):
-    one_m = tf.constant(1.0, tf.float64)
+def reflectance(wavelength, theta_in, n0, n, d):
     zeros_m = tf.constant(0.0, tf.float64)
 
-    #    All units here are in nm and nm-1
-    d = d1
-
-    # print (ns.shape, 'nsshape')
-
     theta_in = tf.complex(theta_in, zeros_m)
-    # cons1 = tf.complex(one_m, zeros_m)
-
-    k0 = 1 / wavelength * 2 * 3.1415926
+    k0 = 1 / wavelength * 2 * np.pi
     k0 = tf.expand_dims(k0, axis=1)
 
-    # print ('n', n, 'thickness_nm', d1)
+    matrix_overall = tmm(theta_in, n0, n, d, k0)
 
-    Matrix_overall = TMM(theta_in, n0, n, d, k0)
-    # print(Matrix_overall.shape, 'final shape')
-
-    # print ('Final matrix', Matrix_overall)
-
-    m00 = Matrix_overall[:, 0, 0]
-    m10 = Matrix_overall[:, 1, 0]
+    m00 = matrix_overall[:, 0, 0]
+    m10 = matrix_overall[:, 1, 0]
     refte = m10 / m00
-    t_te = 1 / m00
-
-    # print ('ref', refte, 'wavelength', wavelength, m00, m10)
-
-    #     Reflectance=tf.real(refte**2)
-    Reflectance = (tf.math.abs(refte)) ** 2
-    Transmission = (tf.math.abs(t_te)) ** 2 * tf.math.real(n[:, -1])
-
-    #     Reflectance=Ref
-    # print ('Y0',Y0, 'Ys', Ys, 'refte',refte)
-    #     return Reflectance
-    absorption1=(1-Reflectance- Transmission)*100
-    return Reflectance
-
-
-
-
-def Si_index(wavelength):
-    k = 10000000 / wavelength  # k is in wavenumber
-
-    Ge_data = np.genfromtxt("dielectric_functions/Silicon_thin_film_NK_franta.txt"
-                            , skip_header=False)
-
-
-    Full_frequency = np.arange(400, 6000, 1)
-    Ge_frequency = Ge_data[:, 0]
-    Ge_real = Ge_data[:, 1]
-    Ge_imag = Ge_data[:, 2]
-
-    f_real = interp1d(Ge_frequency, Ge_real)
-    f_imag = interp1d(Ge_frequency, Ge_imag)
-    Full_real_inter = f_real(Full_frequency)
-    Full_imag_inter = f_imag(Full_frequency)
-    # print(Full_real_inter, 'aaaa')
-
-    Ge_real_inter = tfp.math.interp_regular_1d_grid(k, x_ref_min=400., x_ref_max=6000., y_ref=Full_real_inter)
-    Ge_imag_inter = tfp.math.interp_regular_1d_grid(k, x_ref_min=400., x_ref_max=6000., y_ref=Full_imag_inter)
-    # print(k, "K here")
-    # Ge_real_inter=np.interp (k, Ge_frequency,Ge_real)
-    # Ge_imag_inter = np.interp(k, Ge_frequency, Ge_imag)
-
-
-    Ge_permitivity = tf.complex(Ge_real_inter, Ge_imag_inter)
-    Ge_refractive_index = Ge_permitivity
-
-    return Ge_refractive_index
-
-
-
-def SiO2_index(wavelength):
-    k = 10000000 / wavelength  # k is in wavenumber
-
-    # Ge_data= np.genfromtxt("dielectric_functions/AlOx_epsilon_v2.txt"
-    #                   , skip_header=False)
-    Ge_data = np.genfromtxt("dielectric_functions/SiO2_NK_franta.txt"
-                            , skip_header=False)
-
-
-    Full_frequency = np.arange(400, 6000, 1)
-    Ge_frequency = Ge_data[:, 0]
-    Ge_real = Ge_data[:, 1]
-    Ge_imag = Ge_data[:, 2]
-
-    f_real = interp1d(Ge_frequency, Ge_real)
-    f_imag = interp1d(Ge_frequency, Ge_imag)
-    Full_real_inter = f_real(Full_frequency)
-    Full_imag_inter = f_imag(Full_frequency)
-
-    Ge_real_inter = tfp.math.interp_regular_1d_grid(k, x_ref_min=400., x_ref_max=6000., y_ref=Full_real_inter)
-    Ge_imag_inter = tfp.math.interp_regular_1d_grid(k, x_ref_min=400., x_ref_max=6000., y_ref=Full_imag_inter)
-
-    # Ge_real_inter=np.interp (k, Ge_frequency,Ge_real)
-    # Ge_imag_inter = np.interp(k, Ge_frequency, Ge_imag)
-
-    Ge_permitivity = tf.complex(Ge_real_inter, Ge_imag_inter)
-    Ge_refractive_index = Ge_permitivity
-
-    return Ge_refractive_index
+    return tf.math.abs(refte) ** 2
 
 
 def blackbody(wavelength):
-
-
-    c = 3e+8
-
+    c = 3e8
     h = 6.625e-34
     k = 1.38e-23
-    T = 500.0
-    Lam=wavelength*1e-9
-    v=c/Lam
 
-    I2=(8 * h * v**3) / ((c** 3) * (tf.math.exp((h * v)/ (k * T)) - 1))*1e+19
+    lam = wavelength * 1e-9
+    v = c / lam
 
-    T = 300.0
-    I1 = (8 * h * v ** 3) / ((c ** 3) * (tf.math.exp((h * v) / (k * T)) - 1)) * 1e+19
+    temp_hot = 500.0
+    hot = (8 * h * v ** 3) / ((c ** 3) * (tf.math.exp((h * v) / (k * temp_hot)) - 1)) * 1e19
 
-    # print (wavelength)
-    # k = 10000000 / wavelength  # k is in wavenumber
+    temp_cold = 300.0
+    cold = (8 * h * v ** 3) / ((c ** 3) * (tf.math.exp((h * v) / (k * temp_cold)) - 1)) * 1e19
 
-
-    return I2-I1
-
-
-
+    return hot - cold
 
 
 def set_target():
-    # The following set target function is to set a gaussian shaped target
+    wavelength_nm = np.arange(400, 3000, 2, dtype=np.float64)
+    wavelength_nm = np.reshape(wavelength_nm, [-1, 1])
+    target = np.zeros_like(wavelength_nm, dtype=np.float64)
 
-    # Define the frequency range and the target spectra
-    # wavenumber_unshuffled =
-    wavelength_unshuffled = np.arange(400,3000, 2)
-    frequency_length = len(wavelength_unshuffled)
-    wavelength_unshuffled = wavelength_unshuffled.reshape(frequency_length, )
-    wavelength_unshuffled = np.float64(wavelength_unshuffled)
-    wavelength_plot = wavelength_unshuffled.astype(np.float64)
+    important_id = np.where(target < 80)
+    wave_important = wavelength_nm[important_id]
+    ref_important = target[important_id]
 
+    return 10000000.0 / wavelength_nm, target, 10000000.0 / wave_important, ref_important
 
-    Ref_target_uns = np.ones((frequency_length, 1)) * 000
-
-
-
-    Ref_target_uns = Ref_target_uns
-
-    wavelength_plot = np.reshape(wavelength_plot, [frequency_length, 1])
-    important_id = np.where(Ref_target_uns <80)
-    wave_important = wavelength_plot[important_id]
-    Ref_important = Ref_target_uns[important_id]
-
-    # print(len(wave_important), 'data point in resonance')
-    # plt.figure()
-    # plt.plot( wavelength_plot, Ref_target_uns)
-    # plt.xlabel('wavelength nm')
-    # plt.ylabel('Reflectivity (%)')
-    #
-    # plt.title('target spectra')
-    # plt.show()
-
-    return 10000000/wavelength_plot, Ref_target_uns, 10000000/wave_important, Ref_important
 
 class MyModel(Model):
-    # class MyModel (Model):
     def __init__(self):
-        super(MyModel, self).__init__()
-        self.layer_length =29
-        self.a = np.random.random(size=self.layer_length) - 0.5
-        self.A = tf.Variable(self.a, trainable=True, dtype=tf.float64)
+        super().__init__()
+        self.layer_length = 29
+        self.A = self.add_weight(
+            name="A",
+            shape=(self.layer_length,),
+            initializer=tf.keras.initializers.RandomUniform(minval=-0.5, maxval=0.5),
+            trainable=True,
+            dtype=tf.float64,
+        )
+        self.B = self.add_weight(
+            name="B",
+            shape=(self.layer_length,),
+            initializer=tf.keras.initializers.RandomUniform(minval=-0.5, maxval=0.5),
+            trainable=True,
+            dtype=tf.float64,
+        )
 
-        self.b = np.random.random(size=self.layer_length) - 0.5
-        self.B = tf.Variable(self.b, trainable=True, dtype=tf.float64)
+        self.si_real_grid, self.si_imag_grid = load_regular_material_grid("Silicon_thin_film_NK_franta.txt")
+        self.sio2_real_grid, self.sio2_imag_grid = load_regular_material_grid("SiO2_NK_franta.txt")
 
+    def si_index(self, wavelength):
+        return material_index_from_grid(wavelength, self.si_real_grid, self.si_imag_grid)
 
-        # self.Carrier=np.random.random(size=2)
-        self.Carrier = np.random.random(size=4) - 0.5
-        self.Carrier = tf.Variable(self.Carrier, trainable=True, dtype=tf.float64)
-        self.Si_index=Si_index
-        self.SiO2_index = SiO2_index
-        self.blackbody=blackbody
+    def sio2_index(self, wavelength):
+        return material_index_from_grid(wavelength, self.sio2_real_grid, self.sio2_imag_grid)
 
-
-
+    def layer_thicknesses(self):
+        d1 = tf.keras.activations.sigmoid(self.A[-self.layer_length:]) * MAX_THICKNESS_NM
+        d2 = tf.keras.activations.sigmoid(self.B[-self.layer_length:]) * MAX_THICKNESS_NM
+        return d1, d2
 
     def call(self, x):
         frequency_length = tf.size(x)
         x = tf.reshape(x, [frequency_length, 1])
         one_m = tf.constant(1.0, tf.float64)
         zeros_m = tf.constant(0.0, tf.float64)
-        x = tf.dtypes.cast(x, tf.float64)
-        carrier1 = self.Carrier
-        # carrier1 = tf.keras.activations.relu(carrier1,max_value=10) * 4 + 0.4
-        carrier1 = tf.keras.activations.sigmoid(carrier1) * 3.6+0.4
-
-
+        x = tf.cast(x, tf.float64)
 
         n0 = tf.complex(one_m, zeros_m)
-        theta_in = one_m * 30 / 180 * 3.1415926
+        theta_in = one_m * INCIDENT_ANGLE_DEG / 180.0 * np.pi
 
-        Ge =  self.Si_index(x)
-        SiO =self.SiO2_index(x)
-        sub = SiO
+        si = self.si_index(x)
+        sio2 = self.sio2_index(x)
+        substrate = sio2
 
-        # print (Ge, 'Ge dielectric function')
-
-        d = self.A[-self.layer_length:]
-        d1 = tf.keras.activations.sigmoid(d) *1350.
-
-
-        d_2 = self.B[-self.layer_length:]
-        d2 = tf.keras.activations.sigmoid(d_2) *1350.
-
-
-        # print(d1, 'thickness information')
-        # print(d2, 'thickness information_t2')
-
-
-
-        #Here is for real material property
-        dielectric1 = tf.concat([Ge, SiO, Ge, SiO, Ge,SiO, Ge ], axis=1)
-        dielectric1 = tf.concat([Ge, SiO, Ge, SiO, Ge, SiO, Ge], axis=1)
-        # Here is for disperseless material property
-        # dielectric1 = [Ge, SiO, Ge, SiO, Ge]
-        # dielectric1 = tf.broadcast_to(dielectric1, [frequency_length, self.layer_length])
-        W, L = dielectric1.shape
-
-
-        global export_t_1,export_t_2
-
-        export_t_1=d1[0:L]
-        export_t_2 = d2[0:L]
+        d1, d2 = self.layer_thicknesses()
+        dielectric_stack = tf.concat([si, sio2, si, sio2, si, sio2, si], axis=1)
+        _, physical_layer_count = dielectric_stack.shape
 
         d1 = tf.broadcast_to(d1, [frequency_length, self.layer_length])
         d2 = tf.broadcast_to(d2, [frequency_length, self.layer_length])
         n0 = tf.broadcast_to(n0, [frequency_length, 1])
-        ns = tf.broadcast_to(sub, [frequency_length, 1])
-        ns_lossless=tf.broadcast_to(sub, [frequency_length, 1])
-        x = tf.reshape(x, [frequency_length, ])
+        substrate = tf.broadcast_to(substrate, [frequency_length, 1])
+        x = tf.reshape(x, [frequency_length])
 
-        n2 = tf.concat([dielectric1, ns, ns, ns, ns], axis=1)
+        n_stack = tf.concat([dielectric_stack, substrate, substrate, substrate, substrate], axis=1)
 
-        thickness_cdo = tf.constant([0,0,0], tf.float64)
-        d_cdo = tf.broadcast_to(thickness_cdo, [frequency_length, 3])
-        d3 = tf.concat([d1, d_cdo], axis=1)
-        d4 = tf.concat([d2, d_cdo], axis=1)
-        # print(thickness_cdo, 'thickness of cdo')
+        zero_thickness_padding = tf.constant([0.0, 0.0, 0.0], tf.float64)
+        zero_thickness_padding = tf.broadcast_to(zero_thickness_padding, [frequency_length, 3])
+        d3 = tf.concat([d1, zero_thickness_padding], axis=1)
+        d4 = tf.concat([d2, zero_thickness_padding], axis=1)
 
-        absorp_1 = (1-reflectance(x, theta_in, n0, n2, d3))
-        absorp_2 = (1 - reflectance(x, theta_in, n0, n2, d4))
+        absorp_1 = 1 - reflectance(x, theta_in, n0, n_stack, d3)
+        absorp_2 = 1 - reflectance(x, theta_in, n0, n_stack, d4)
+        combined_absorp = tf.math.abs(
+            absorp_1 * absorp_2 / (absorp_1 + absorp_2 - absorp_1 * absorp_2)
+        ) * blackbody(x)
 
-        absorp1=tf.math.abs(absorp_1*absorp_2/(absorp_1+absorp_2-absorp_1*absorp_2))*self.blackbody(x)
+        self._export_t_1 = self.layer_thicknesses()[0][0:physical_layer_count]
+        self._export_t_2 = self.layer_thicknesses()[1][0:physical_layer_count]
 
+        return combined_absorp, blackbody(x), absorp_1, absorp_2
 
-
-
-
-        return absorp1,   self.blackbody(x),absorp_1,absorp_2
-
-
-def Linf(ypred, y):
-    res = (ypred - y) ** 2
-    res = tf.reduce_max(res)
-    return res
+    def export_thicknesses(self):
+        if not hasattr(self, "_export_t_1"):
+            d1, d2 = self.layer_thicknesses()
+            return d1[:7], d2[:7]
+        return self._export_t_1, self._export_t_2
 
 
-# set the target spectra
-wavelength, ref_target, wavelength_important, ref_important = set_target()
+def linf(ypred, y):
+    return tf.reduce_max((ypred - y) ** 2)
 
 
-train_ds = tf.data.Dataset.from_tensor_slices((wavelength, ref_target)).shuffle(5000).batch(256)
-
-
-
-EPOCHS = 1500
-
-number_of_trails=10
-best_loss=100000
-best_d1=[]
-best_d2=[]
-for trails_id in range (number_of_trails):
-
-    # Define the model
+def train_one_trial(train_ds):
     model = MyModel()
-    tf.keras.backend.set_floatx('float64')
     loss_object = tf.keras.losses.MeanSquaredError()
-    loss_object1 = tf.keras.losses.MeanAbsoluteError()
-    loss_object3 = Linf
 
-    initial_learning_rate = 0.01
-    lr_schedule2 = tf.keras.optimizers.schedules.ExponentialDecay(
-        initial_learning_rate,
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        INITIAL_LEARNING_RATE,
         decay_steps=500,
         decay_rate=0.7,
-        staircase=True)
-
-
-    optimizer2 = tf.keras.optimizers.Adam(learning_rate=lr_schedule2)
-    # optimizer=tf.keras.optimizers.SGD (learning_rate=10.0)
-    train_loss = tf.keras.metrics.Mean(name='train_loss')
-    test_loss = tf.keras.metrics.Mean(name='test_loss')
-
-
+        staircase=True,
+    )
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    train_loss = tf.keras.metrics.Mean(name="train_loss")
 
     @tf.function
-    def train_step1(images, labels1):
+    def train_step(images, labels):
         with tf.GradientTape() as tape:
-            # training=True is only needed if there are layers with different
-            # behavior during training versus inference (e.g. Dropout).
-            print(model.trainable_variables, 'all variables')
-            prediction1, prediction2, prediction3, prediction4 = model(images, training=True)
-
-            loss = loss_object(labels1, prediction1)
+            prediction, _, _, _ = model(images, training=True)
+            loss = loss_object(labels, prediction)
         gradients = tape.gradient(loss, model.trainable_variables)
-        optimizer2.apply_gradients(zip(gradients, model.trainable_variables))
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
         train_loss(loss)
 
-
-
-
-
-
     for epoch in range(EPOCHS):
-        # Reset the metrics at the start of the next epoch
-        train_loss.reset_states()
-        test_loss.reset_states()
-
-        for images, labels1 in train_ds:
-            train_step1(images, labels1)
+        train_loss.reset_state()
+        for images, labels in train_ds:
+            train_step(images, labels)
 
         if epoch % 600 == 0 or epoch == 0:
-            template = 'Epoch {}, Loss: {}'
-            print(template.format(epoch + 1,
-                                  train_loss.result(),
-                                  ))
+            print(f"Epoch {epoch + 1}, Loss: {train_loss.result()}")
 
-    frequency_len = len(wavelength)
-
-    wavelength_wide =   np.arange(100,20000, 10)
-    wavelength_wide=10000000/wavelength_wide
-    wavelength_wide = np.reshape(wavelength_wide, [1990, 1])
-
-    abs1,abs2,abs3,abs4 = model(wavelength)
-    designed_spectra =abs1
-
-    current_loss=sum(abs1)
-    if current_loss<best_loss:
-        best_loss=current_loss
-        best_d1=export_t_1
-        best_d2=export_t_2
-        print ("replaced",trails_id, best_d1,best_d2,current_loss)
+    return model
 
 
-print ("Final",trails_id, best_d1,best_d2,best_loss)
+def plot_results(wavelength, ref_target, abs1, abs2, abs3, abs4):
+    plt.figure()
+    plt.plot(10000000.0 / wavelength, ref_target, label="target")
+    plt.plot(10000000.0 / wavelength, abs1, label="absorption from inverse design1")
+    plt.plot(10000000.0 / wavelength, abs3, label="abs meta 1")
+    plt.plot(10000000.0 / wavelength, abs4, label="abs meta 2")
+
+    print("sum of the absorption", tf.reduce_sum(abs1).numpy())
+
+    plt.title("designed")
+    plt.xlabel("wavenumber(cm-1)")
+    plt.ylabel("Absorption(%)")
+    plt.legend()
+
+    plt.figure()
+    plt.plot(10000000.0 / wavelength, abs2, label="bb spectrum")
+    plt.xlabel("wavenumber(cm-1)")
+    plt.ylabel("Power")
+    plt.legend()
+    plt.show()
 
 
+def save_designed_spectra(wavelength, designed_spectra):
+    output = np.zeros((len(wavelength), 2))
+    output[:, 0] = 10000000.0 / wavelength[:, 0]
+    output[:, 1] = np.asarray(designed_spectra)
+    np.savetxt(SCRIPT_DIR / "designed_spectra.csv", output, delimiter=",")
 
 
+def main():
+    configure_tensorflow()
+
+    wavelength, ref_target, _, _ = set_target()
+    train_ds = (
+        tf.data.Dataset.from_tensor_slices((wavelength, ref_target))
+        .shuffle(SHUFFLE_BUFFER)
+        .batch(BATCH_SIZE)
+    )
+
+    best_loss = np.inf
+    best_d1 = None
+    best_d2 = None
+    best_outputs = None
+
+    for trial_id in range(NUM_TRIALS):
+        model = train_one_trial(train_ds)
+        abs1, abs2, abs3, abs4 = model(wavelength)
+
+        current_loss = tf.reduce_sum(abs1).numpy()
+        if current_loss < best_loss:
+            best_loss = current_loss
+            best_d1, best_d2 = model.export_thicknesses()
+            best_outputs = (abs1, abs2, abs3, abs4)
+            print("replaced", trial_id, best_d1.numpy(), best_d2.numpy(), current_loss)
+
+    print("Final", NUM_TRIALS - 1, best_d1.numpy(), best_d2.numpy(), best_loss)
+
+    abs1, abs2, abs3, abs4 = best_outputs
+    plot_results(wavelength, ref_target, abs1, abs2, abs3, abs4)
+    save_designed_spectra(wavelength, abs1)
 
 
-
-
-
-
-
-
-
-
-
-# ref_target_plot=(ref_target-ref_target.min())/(ref_target.max()-ref_target.min())
-plt.figure()
-# plt.plot(10000000/wavelength, designed_spectra, label='Spectra from inverse design', linewidth=6)
-# plt.plot (10000000/wavelength, ref_target, label='target spectra', linewidth=0.5)
-
-plt.plot(10000000/wavelength,  ref_target, label='target')
-# plt.plot(10000000 / wavelength, transmission, label='transmission from inverse design')
-plt.plot( 10000000/wavelength, abs1, label='absoprtion from inverse design1')
-plt.plot( 10000000/wavelength, abs3, label='abs meta 1')
-plt.plot( 10000000/wavelength, abs4, label='abs meta 2')
-
-
-print("sum of the absorption",sum(abs1))
-
-plt.title('designed')
-plt.xlabel('wavenumber(cm-1)')
-plt.ylabel('Absorption(%)')
-plt.legend()
-
-
-plt.figure()
-
-
-plt.plot( 10000000/wavelength, abs2, label='bb spectrum')
-
-plt.xlabel('wavenumber(cm-1)')
-plt.ylabel('Power')
-plt.legend()
-
-
-
-
-
-plt.show()
-
-
-
-
-
-
-Designed_output = np.zeros((frequency_len, 2))
-Designed_output[:, 0] = 10000000/wavelength[:, 0]
-Designed_output[:, 1] = designed_spectra
-# Designed_output[:, 2] = transmission
-#
-# print(model.trainable_variables)
-# ind = 0
-# # temp=np.zeros((12,12))
-#
-#
-# # np.savetxt('tam_designed.csv',designed_structure, delimiter=",")
-
-np.savetxt('designed_spectra.csv', Designed_output, delimiter=",")
-# # np.savetxt('tam_designed.csv',designed_structure, delimiter=",")
+if __name__ == "__main__":
+    main()
